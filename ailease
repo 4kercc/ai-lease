@@ -2348,7 +2348,9 @@ main() {
 
   case "$sub" in
     ""|-h|--help|help) usage; exit 0 ;;
-    install)   require_root; shift; cmd_install "${1:-host}" ;;
+    # 注意：管道裸跑（wget … | sudo bash）时 $# 为 0，这里不能 shift，
+    # 否则 shift 报错 + set -e 会让整条快捷安装静默失败。直接用 $2 取目标。
+    install)   require_root; cmd_install "${2:-host}" ;;
     uninstall) require_root; shift; cmd_uninstall "$@" ;;
     check)     require_root; cmd_check ;;
     list|ls)   require_root; cmd_list ;;

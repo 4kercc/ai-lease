@@ -47,14 +47,17 @@ sudo ./ailease install all      # 两者（等价 docker，因为 docker 版包�
 
 `install docker` 在此之上：检测并**尝试自动安装 docker**（apt/dnf/yum/zypper/apk）→ 拉取或构建基础镜像。装不上不致命，账号版照常可用。
 
-一行从网上装（默认装账号版）：
+一行从网上装：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease | sudo bash
+# 推荐：docker 版 + 账号版，装完直接 ailease new 起容器
 wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease | sudo bash -s install docker
+
+# 只装账号版（不碰 docker）
+wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease | sudo bash
 ```
 
-脚本检测到被管道喂进来（`$0` 是 `bash`），会按内置地址把主程序落到 `/usr/local/sbin/ailease`。别写成 `bash install`——那会让 bash 去找名为 `install` 的文件，管道内容被忽略；要么省略参数，要么 `bash -s install docker`。自建镜像站用 `AILEASE_URL=https://你的地址` 覆盖。
+脚本检测到被管道喂进来（`$0` 是 `bash`），会按内置地址把主程序落到 `/usr/local/sbin/ailease`。**别写成 `bash install`**——那会让 bash 去找名为 `install` 的文件，管道内容被忽略；要指定安装目标就用 `bash -s install docker`。自建镜像站用 `AILEASE_URL=https://你的地址` 覆盖。
 
 ### 2. 开环境
 
