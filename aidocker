@@ -45,8 +45,8 @@ set -Eeuo pipefail
 VERSION="1.0.0"
 SELF_DEST="/usr/local/sbin/aidocker"
 # 一次性安装用：管道执行（wget … | bash）时脚本不在文件系统上，靠这个地址回取自身
-SELF_URL="${AIDOCKER_URL:-https://cikeblog.com/aidocker}"
-BASE_IMAGE="4kerccc/aidocker-base:bookworm"
+SELF_URL="${AIDOCKER_URL:-https://raw.githubusercontent.com/4kercc/ai-lease/main/aidocker}"
+BASE_IMAGE="aidocker-base:bookworm"
 LIB_DIR="/var/lib/aidocker"
 META_DIR="$LIB_DIR/containers"
 LOG_DIR="/var/log/aidocker"

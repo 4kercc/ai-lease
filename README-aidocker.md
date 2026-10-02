@@ -42,13 +42,13 @@ sudo ./aidocker install
 一行从网上直接装：
 
 ```bash
-wget -qO- cikeblog.com/aidocker | sudo bash
+wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/aidocker | sudo bash
 ```
 
 脚本检测到自己是被管道喂进来的（`$0` 是 `bash` 而不是文件路径），会自动按内置地址把主程序落到 `/usr/local/sbin/aidocker`。也可以显式写子命令：
 
 ```bash
-wget -qO- cikeblog.com/aidocker | sudo bash -s install
+wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/aidocker | sudo bash -s install
 ```
 
 **别写成 `bash install`** —— 那会让 bash 去找一个名为 `install` 的文件，管道内容直接被忽略。要么省略参数，要么用 `bash -s install`。
@@ -59,7 +59,7 @@ wget -qO- cikeblog.com/aidocker | sudo bash -s install
 wget -qO- 你的地址 | sudo AIDOCKER_URL=https://你的地址 bash
 ```
 
-从 Docker Hub 拉取基础镜像 `4kerccc/aidocker-base:bookworm`（多架构，约 150MB），并安装到期回收器。拉不到才回退本地构建，构建过程带内存上限，不会把小机器的其他服务拖垮。
+基础镜像 `aidocker-base:bookworm` 由仓库自带的 `Dockerfile` 本地构建（会先试 `docker pull`，拉不到就本地构建），并安装到期回收器。构建过程带内存上限，不会把小机器的其他服务拖垮。
 
 ### 2. 起容器
 
@@ -70,7 +70,7 @@ sudo aidocker new ai /clicd 2h
 输出：
 
 ```
- 登录     ssh -p 2001 root@1.1.1.1
+ 登录     ssh -p 2001 root@你的服务器IP
  密码     Q^QZ1TgTrmK+V#UG1d3u+F9T
  路径     /clicd -> /work (rw)
  到期     2026-10-02 22:15:31（2h0m 后）
@@ -158,20 +158,20 @@ sudo aidocker new ai /clicd never
 
 ## 镜像分发
 
-默认镜像已发布在 Docker Hub：`4kerccc/aidocker-base:bookworm`（多架构，amd64 + arm64）。
+默认镜像 `aidocker-base:bookworm` 由仓库自带的 `Dockerfile` 本地构建，不依赖任何外部 registry。
 
-`install` 和 `new` 都会**优先 `docker pull`**，拉不到才回退本地构建。所以新机器上一条命令就够：
+`install` 和 `new` 都会**优先 `docker pull`**，拉不到才本地构建。所以新机器上一条命令就够：
 
 ```bash
 sudo aidocker install
 ```
 
-### 换自己的镜像
+### 用自己的镜像
 
-改 `aidocker` 第 49 行：
+如果你已经把镜像推到了自己的 registry，改 `aidocker` 第 49 行的 `BASE_IMAGE`：
 
 ```bash
-BASE_IMAGE="<你的用户名>/aidocker-base:bookworm"
+BASE_IMAGE="<你的镜像名>"
 ```
 
 重跑 `install` 会自动同步进 `/etc/aidocker/config`——已装过的机器不用手工改配置。
@@ -179,8 +179,8 @@ BASE_IMAGE="<你的用户名>/aidocker-base:bookworm"
 仓库里的 `Dockerfile` 可直接构建推送：
 
 ```bash
-docker build -t <用户名>/aidocker-base:bookworm .
-docker push <用户名>/aidocker-base:bookworm
+docker build -t <你的镜像名> .
+docker push <你的镜像名>
 ```
 
 多架构一次推：
@@ -188,7 +188,7 @@ docker push <用户名>/aidocker-base:bookworm
 ```bash
 docker buildx create --use --name aidocker-builder
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t <用户名>/aidocker-base:bookworm --push .
+  -t <你的镜像名> --push .
 ```
 
 **arm64 在 x86 机器上会很慢**：要经 QEMU 逐条翻译 ARM 指令，`apt-get install` 那一层 amd64 用 24 秒，arm64 起步 187 秒，整层跑完十几分钟。只用 x86 服务器的话 `--platform linux/amd64` 就够了；确实要 arm64 建议挂 GitHub Actions 用原生 runner。
@@ -324,7 +324,7 @@ DEFAULT_DURATION="24h"
 DEFAULT_MEM="128m"          # install 时按宿主机内存算出
 DEFAULT_CPUS="1"
 DEFAULT_PIDS="512"
-DEFAULT_IMAGE="4kerccc/aidocker-base:bookworm"
+DEFAULT_IMAGE="aidocker-base:bookworm"
 DEFAULT_BIND="127.0.0.1"
 PURGE_ON_EXPIRE="no"        # yes = 到期直接删容器
 REAPER_INTERVAL_SEC=60
@@ -376,7 +376,7 @@ sudo aidocker new ai /clicd 2h --image=ubuntu:24.04
 ```bash
 sudo aidocker uninstall          # 只卸回收器，保留容器
 sudo aidocker uninstall --all    # 连同所有受管容器一起删
-docker rmi 4kerccc/aidocker-base:bookworm debian:bookworm-slim
+docker rmi aidocker-base:bookworm debian:bookworm-slim
 sudo rm -rf /var/lib/aidocker /etc/aidocker /var/log/aidocker /usr/local/sbin/aidocker
 ```
 

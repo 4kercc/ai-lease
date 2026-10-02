@@ -50,8 +50,8 @@ sudo ./ailease install all      # 两者（等价 docker，因为 docker 版包�
 一行从网上装（默认装账号版）：
 
 ```bash
-wget -qO- cikeblog.com/ailease | sudo bash
-wget -qO- cikeblog.com/ailease | sudo bash -s install docker
+wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease | sudo bash
+wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease | sudo bash -s install docker
 ```
 
 脚本检测到被管道喂进来（`$0` 是 `bash`），会按内置地址把主程序落到 `/usr/local/sbin/ailease`。别写成 `bash install`——那会让 bash 去找名为 `install` 的文件，管道内容被忽略；要么省略参数，要么 `bash -s install docker`。自建镜像站用 `AILEASE_URL=https://你的地址` 覆盖。
@@ -137,7 +137,7 @@ sudo ailease del ai               # 删除（会先问一句）
 
 容器选项：`--ro` `--public` `--bind=` `--port=` `--readonly` `--password=` `--pubkey=` `--pubkey-file=` `--user=` `--image=` `--mem=` `--cpus=` `--pids=`。
 
-镜像默认 `4kerccc/aidocker-base:bookworm`（多架构）。`install`/`new` 都优先 `docker pull`，拉不到才本地构建（构建带内存上限，不会拖垮小机器）。改镜像名见脚本顶部 `BASE_IMAGE`，重跑 `install` 会同步进配置。离线分发用 `export` / `import`。
+基础镜像默认 `ailease-base:bookworm`，由仓库自带的 `Dockerfile` **本地构建**，不依赖任何外部 registry（`install`/`new` 仍会先试 `docker pull`，拉不到就本地构建；构建带内存上限，不会拖垮小机器）。想改用自己推送到 registry 的现成镜像，把 `/etc/ailease/config` 里的 `DEFAULT_IMAGE` 指过去即可，重跑 `install` 会同步进配置。离线分发用 `export` / `import`。
 
 ---
 
@@ -251,7 +251,7 @@ INSTALL_DOCKER="yes"            # install docker 时是否自动装 docker（--n
 DEFAULT_MEM="512m"              # install 时按宿主机内存算出
 DEFAULT_CPUS="2"
 DEFAULT_PIDS="512"
-DEFAULT_IMAGE="4kerccc/aidocker-base:bookworm"
+DEFAULT_IMAGE="ailease-base:bookworm"
 DEFAULT_BIND="127.0.0.1"
 ```
 
@@ -289,7 +289,7 @@ sudo ailease uninstall --all    # 连同所有容器与账号一起清
 之后可手工清理残留：
 
 ```bash
-docker rmi 4kerccc/aidocker-base:bookworm
+docker rmi ailease-base:bookworm debian:bookworm-slim
 sudo rm -rf /var/lib/ailease /etc/ailease /var/log/ailease /usr/local/sbin/ailease
 ```
 

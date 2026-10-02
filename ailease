@@ -38,7 +38,7 @@ VERSION="2.0.0"
 SELF_DEST="/usr/local/sbin/ailease"
 AIRM_DEST="/usr/local/sbin/ailease-rm"
 # 管道执行（wget … | bash）时脚本不在文件系统上，靠这个地址回取自身
-SELF_URL="${AILEASE_URL:-https://cikeblog.com/ailease}"
+SELF_URL="${AILEASE_URL:-https://raw.githubusercontent.com/4kercc/ai-lease/main/ailease}"
 
 CONF_DIR="/etc/ailease"
 CONF_FILE="$CONF_DIR/config"
@@ -69,7 +69,9 @@ REAPER_INTERVAL_SEC=60
 INSTALL_DOCKER="yes"               # install 时是否尝试自动装 docker
 
 # 容器默认
-BASE_IMAGE="4kerccc/aidocker-base:bookworm"
+# 基础镜像：默认本地构建（仓库自带 Dockerfile），不依赖任何外部 registry。
+# 想用现成镜像就在 /etc/ailease/config 里把 DEFAULT_IMAGE 指到你的镜像名。
+BASE_IMAGE="ailease-base:bookworm"
 BUILTIN_IMAGE="$BASE_IMAGE"        # 脚本内置默认值；升级时用它同步旧配置
 DEFAULT_IMAGE="$BASE_IMAGE"
 DEFAULT_BIND="127.0.0.1"
