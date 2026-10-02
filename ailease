@@ -69,9 +69,9 @@ REAPER_INTERVAL_SEC=60
 INSTALL_DOCKER="yes"               # install 时是否尝试自动装 docker
 
 # 容器默认
-# 基础镜像：默认本地构建（仓库自带 Dockerfile），不依赖任何外部 registry。
-# 想用现成镜像就在 /etc/ailease/config 里把 DEFAULT_IMAGE 指到你的镜像名。
-BASE_IMAGE="ailease-base:bookworm"
+# 基础镜像：默认从 Docker Hub 拉现成的（多架构）；拉不到会回退用仓库自带的
+# Dockerfile 本地构建。想换成自己编译的镜像，改这里或 /etc/ailease/config 的 DEFAULT_IMAGE。
+BASE_IMAGE="4kerccc/aidocker-base:bookworm"
 BUILTIN_IMAGE="$BASE_IMAGE"        # 脚本内置默认值；升级时用它同步旧配置
 DEFAULT_IMAGE="$BASE_IMAGE"
 DEFAULT_BIND="127.0.0.1"
@@ -2030,13 +2030,12 @@ EOF
       chmod 640 "$CONF_FILE"
       ok "默认配置 -> $CONF_FILE"
     else
-      # 脚本里的默认镜像可能变了，同步进旧配置，否则已装过的机器一直抱着老镜像名
+      # 配置一旦写成就以它为准：用户可能把 DEFAULT_IMAGE 指到了自己编译的镜像，
+      # 不能被脚本内置默认悄悄覆盖。只在两者不一致时提示一句。
       local cur
       cur="$(grep '^DEFAULT_IMAGE=' "$CONF_FILE" | head -n1 | cut -d= -f2- | tr -d '"')"
       if [[ -n $cur && $cur != "$BUILTIN_IMAGE" ]]; then
-        sed -i "s|^DEFAULT_IMAGE=.*|DEFAULT_IMAGE=\"$BUILTIN_IMAGE\"|" "$CONF_FILE"
-        DEFAULT_IMAGE="$BUILTIN_IMAGE"
-        info "默认镜像已更新：$cur -> $BUILTIN_IMAGE"
+        info "当前配置使用镜像：$cur（脚本内置默认为 $BUILTIN_IMAGE，保持你的设置不变）"
       fi
     fi
 

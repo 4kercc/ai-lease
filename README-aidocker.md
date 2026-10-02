@@ -1,6 +1,6 @@
 # aidocker
 
-> ⚠️ 本工具已并入 [`ailease`](README-ailease.md)，对应 `ailease new ...`（默认容器模式）。本文件作为历史参考保留，新部署请直接用 `ailease`。
+> ⚠️ 本工具已并入 [`ailease`](README.md)，对应 `ailease new ...`（默认容器模式）。本文件作为历史参考保留，新部署请直接用 `ailease`。
 
 给 AI 一个**用完即焚的一次性容器**：它在容器里是 root，随便折腾，但能碰到的只有你挂进去的那一个目录。
 
@@ -59,7 +59,7 @@ wget -qO- https://raw.githubusercontent.com/4kercc/ai-lease/main/aidocker | sudo
 wget -qO- 你的地址 | sudo AIDOCKER_URL=https://你的地址 bash
 ```
 
-基础镜像 `aidocker-base:bookworm` 由仓库自带的 `Dockerfile` 本地构建（会先试 `docker pull`，拉不到就本地构建），并安装到期回收器。构建过程带内存上限，不会把小机器的其他服务拖垮。
+从 Docker Hub 拉取基础镜像 `4kerccc/aidocker-base:bookworm`（多架构，约 150MB），并安装到期回收器。拉不到才回退本地构建，构建过程带内存上限，不会把小机器的其他服务拖垮。
 
 ### 2. 起容器
 
@@ -158,9 +158,9 @@ sudo aidocker new ai /clicd never
 
 ## 镜像分发
 
-默认镜像 `aidocker-base:bookworm` 由仓库自带的 `Dockerfile` 本地构建，不依赖任何外部 registry。
+默认镜像已发布在 Docker Hub：`4kerccc/aidocker-base:bookworm`（多架构，amd64 + arm64）。
 
-`install` 和 `new` 都会**优先 `docker pull`**，拉不到才本地构建。所以新机器上一条命令就够：
+`install` 和 `new` 都会**优先 `docker pull`**，拉不到才回退本地构建。所以新机器上一条命令就够：
 
 ```bash
 sudo aidocker install
@@ -324,7 +324,7 @@ DEFAULT_DURATION="24h"
 DEFAULT_MEM="128m"          # install 时按宿主机内存算出
 DEFAULT_CPUS="1"
 DEFAULT_PIDS="512"
-DEFAULT_IMAGE="aidocker-base:bookworm"
+DEFAULT_IMAGE="4kerccc/aidocker-base:bookworm"
 DEFAULT_BIND="127.0.0.1"
 PURGE_ON_EXPIRE="no"        # yes = 到期直接删容器
 REAPER_INTERVAL_SEC=60
@@ -376,7 +376,7 @@ sudo aidocker new ai /clicd 2h --image=ubuntu:24.04
 ```bash
 sudo aidocker uninstall          # 只卸回收器，保留容器
 sudo aidocker uninstall --all    # 连同所有受管容器一起删
-docker rmi aidocker-base:bookworm debian:bookworm-slim
+docker rmi 4kerccc/aidocker-base:bookworm debian:bookworm-slim
 sudo rm -rf /var/lib/aidocker /etc/aidocker /var/log/aidocker /usr/local/sbin/aidocker
 ```
 
