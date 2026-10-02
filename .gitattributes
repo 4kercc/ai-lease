@@ -1,0 +1,7 @@
+# 本仓库是 Linux 用的 bash 工具，必须保证仓库内与检出后都是 LF，
+# 否则 Windows 上 clone 再传到服务器会变成 CRLF，脚本报 bad interpreter。
+* text=auto eol=lf
+*.sh text eol=lf
+ailease text eol=lf
+aidocker text eol=lf
+Dockerfile text eol=lf
