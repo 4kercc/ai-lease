@@ -1,0 +1,1082 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# =============================================================================
+#  aidocker — 给 AI 一个用完即焚的一次性容器（单文件 / root 运行）
+# =============================================================================
+#  比宿主机临时账号更强的隔离：AI 在容器内是 root，随便折腾，
+#  但能碰到的只有你挂进去的那一个目录。
+#
+#    1. 一条命令起容器：只挂一个宿主目录，容器内 root 权限
+#    2. 存活时长到期自动停容器，事后一键连容器带数据删掉
+#    3. 默认只监听 127.0.0.1、限制内存/CPU/进程数、削减 capability
+#    4. 绝不挂 docker.sock、绝不 --privileged、绝不 host 网络/pid
+#
+#  快速开始
+#    sudo ./aidocker install
+#    sudo ./aidocker new ai /clicd 2h
+#    ssh -p <打印的端口> root@127.0.0.1
+#    sudo ./aidocker del ai
+#
+#  子命令
+#    install    构建基础镜像 + 安装到期回收器
+#    uninstall  卸载回收器（--all 连同所有受管容器一起删）
+#    new        起一个容器
+#    list       列出受管容器与剩余时间
+#    status     查看单个容器详情
+#    exec       进入容器（等同于 docker exec -it）
+#    extend     延长存活时长
+#    del        停掉并删除容器
+#    cleanup    扫描并回收过期容器（回收器定时调用）
+#    check      环境自检
+#
+#  ⚠ 三条铁律（脚本已强制，勿手工绕过）
+#    1. 不挂 /var/run/docker.sock —— 挂了等于给容器宿主机 root
+#    2. 不用 --privileged / --pid=host / --network=host —— 隔离直接归零
+#    3. 不挂 /、/etc、/root、/home 等宿主目录 —— 只挂你要给的那一个
+#
+#  ⚠ 两条必须知道的边界
+#    1. bind mount 的目录没有磁盘配额。容器内写满它 = 写满宿主机对应分区。
+#       大目录请单独分区或上 quota。
+#    2. 容器内 root 写出的文件，在宿主机上属主是 root。你要能改就加 --user。
+# =============================================================================
+
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+SELF_DEST="/usr/local/sbin/aidocker"
+# 一次性安装用：管道执行（wget … | bash）时脚本不在文件系统上，靠这个地址回取自身
+SELF_URL="${AIDOCKER_URL:-https://cikeblog.com/aidocker}"
+BASE_IMAGE="4kerccc/aidocker-base:bookworm"
+LIB_DIR="/var/lib/aidocker"
+META_DIR="$LIB_DIR/containers"
+LOG_DIR="/var/log/aidocker"
+AUDIT_LOG="$LOG_DIR/audit.log"
+LOCK_FILE="$LIB_DIR/.lock"
+CONF_FILE="/etc/aidocker/config"
+REAPER_SVC="/etc/systemd/system/aidocker-reaper.service"
+REAPER_TIMER="/etc/systemd/system/aidocker-reaper.timer"
+REAPER_CRON="/etc/cron.d/aidocker"
+LOGROTATE_CONF="/etc/logrotate.d/aidocker"
+NAME_PREFIX="aidocker-"
+
+DEFAULT_DURATION="24h"
+DEFAULT_IMAGE="$BASE_IMAGE"
+BUILTIN_IMAGE="$DEFAULT_IMAGE"    # 脚本内置默认值；升级时用它同步旧配置
+DEFAULT_BIND="127.0.0.1"
+
+# 资源默认值按宿主机实况推算：写死大值会在小内存机器上直接起不来
+_host_mem_mb="$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+if (( _host_mem_mb > 0 )); then
+  _quarter=$(( _host_mem_mb / 4 ))
+  (( _quarter < 128 )) && _quarter=128
+  (( _quarter > 2048 )) && _quarter=2048
+  DEFAULT_MEM="${_quarter}m"
+else
+  DEFAULT_MEM="1g"
+fi
+_host_cpu="$(nproc 2>/dev/null || echo 1)"
+if (( _host_cpu < 2 )); then DEFAULT_CPUS="$_host_cpu"; else DEFAULT_CPUS="2"; fi
+DEFAULT_PIDS="512"
+PURGE_ON_EXPIRE="no"
+KILL_ON_EXPIRE="yes"
+REAPER_INTERVAL_SEC=60
+[ -r "$CONF_FILE" ] && . "$CONF_FILE" || true
+
+DRY_RUN="no"
+QUIET="no"
+COLOR="no"
+[[ -t 1 ]] && COLOR="yes"
+if [[ $COLOR == yes ]]; then
+  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
+  C_B=$'\033[36m'; C_D=$'\033[2m';  C_0=$'\033[0m'
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""
+fi
+
+log()  { [[ $QUIET == yes ]] && return 0; printf '%s\n' "$*"; }
+info() { [[ $QUIET == yes ]] && return 0; printf '%s[*]%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { [[ $QUIET == yes ]] && return 0; printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+
+audit() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s | actor=%s | %s\n' "$(date -Is)" "${SUDO_USER:-root}" "$*" \
+    >>"$AUDIT_LOG" 2>/dev/null || true
+}
+
+run() {
+  if [[ $DRY_RUN == yes ]]; then
+    printf '  %s[dry-run]%s %s\n' "$C_D" "$C_0" "$*"
+    return 0
+  fi
+  "$@"
+}
+
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "需要 root 运行（sudo $0 $*）"; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 探测本机公网 IPv4：绑 0.0.0.0 时用它把登录地址显示成外部可达的地址。
+# 依次尝试多个服务，任何一个返回合法 IPv4 就采用。
+detect_public_ip() {
+  need_cmd curl || return 1
+  local svc ip
+  for svc in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com" "https://ipv4.icanhazip.com"; do
+    ip="$(curl -fsS -m 5 "$svc" 2>/dev/null | tr -d '[:space:]')" || continue
+    [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && { printf '%s' "$ip"; return 0; }
+  done
+  return 1
+}
+
+# 取本脚本的真实路径；管道执行（wget … | bash）时 $0 是 bash，这里返回失败
+self_path() {
+  local p="$0"
+  [[ -n $p && -f $p && -r $p ]] || return 1
+  head -n1 "$p" 2>/dev/null | grep -q '^#!' || return 1
+  readlink -f "$p" 2>/dev/null || printf '%s' "$p"
+}
+
+docker_ok() {
+  need_cmd docker || return 1
+  docker info >/dev/null 2>&1 || return 1
+  return 0
+}
+
+require_docker() {
+  need_cmd docker || die "未安装 docker（apt install -y docker.io 或见官方文档）"
+  docker info >/dev/null 2>&1 || die "连不上 docker 守护进程（服务没起？当前用户在 docker 组里吗？）"
+}
+
+ensure_dirs() {
+  mkdir -p "$LIB_DIR" "$META_DIR" "$LOG_DIR" "$(dirname "$CONF_FILE")"
+  chmod 700 "$LIB_DIR" "$META_DIR"
+  chmod 750 "$LOG_DIR"
+}
+
+# ------------------------------------------------------------------ 时长解析
+# 永不过期的写法
+is_never() {
+  local s="$1"
+  [[ $s == never || $s == forever || $s == permanent ]]
+}
+
+parse_duration() {
+  local s="$1" total=0 num unit mult rest
+  [[ -z $s ]] && die "时长不能为空"
+  is_never "$s" && { printf '0'; return 0; }
+  if [[ $s =~ ^[0-9]+$ ]]; then
+    (( s > 0 )) || die "时长必须大于 0（要永不过期请写 never）"
+    printf '%s' "$s"; return 0
+  fi
+  rest="$s"
+  while [[ -n $rest ]]; do
+    if [[ $rest =~ ^([0-9]+)([smhdw])(.*)$ ]]; then
+      num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+    else
+      die "非法时长格式：$s（示例：30m 2h 12h 7d，或 never 表示永不过期）"
+    fi
+    case "$unit" in
+      s) mult=1 ;; m) mult=60 ;; h) mult=3600 ;; d) mult=86400 ;; w) mult=604800 ;;
+    esac
+    total=$(( total + num * mult ))
+  done
+  (( total > 0 )) || die "时长必须大于 0"
+  printf '%s' "$total"
+}
+
+is_duration() {
+  local s="$1"
+  is_never "$s" && return 0
+  [[ $s =~ ^([0-9]+[smhdw])+$ ]] || [[ $s =~ ^[0-9]+$ ]]
+}
+
+human_duration() {
+  local s="$1" d h m
+  (( s < 0 )) && { printf '已过期'; return 0; }
+  d=$(( s / 86400 )); s=$(( s % 86400 ))
+  h=$(( s / 3600 ));  s=$(( s % 3600 ))
+  m=$(( s / 60 ))
+  if   (( d > 0 )); then printf '%dd%dh' "$d" "$h"
+  elif (( h > 0 )); then printf '%dh%dm' "$h" "$m"
+  else                   printf '%dm' "$m"
+  fi
+}
+
+# ------------------------------------------------------------------ meta 读写
+meta_file()   { printf '%s/%s.meta' "$META_DIR" "$1"; }
+container_of(){ printf '%s%s' "$NAME_PREFIX" "$1"; }
+
+is_managed() {
+  local f; f="$(meta_file "$1")"
+  [[ -s $f ]] && grep -q '^C_NAME=' "$f" 2>/dev/null
+}
+
+meta_load() {
+  local name="$1" f
+  f="$(meta_file "$name")"
+  [[ -r $f ]] || die "容器 $name 不在管理范围内（找不到 $f）"
+  # shellcheck disable=SC1090
+  . "$f"
+  [[ -n ${C_NAME:-} && -n ${C_CONTAINER:-} ]] \
+    || die "元数据损坏或为空：$f
+    若该容器已不存在，删掉这个文件即可：rm -f $f"
+  # 同步进 meta_save 使用的 M_* 命名空间
+  M_NAME="${C_NAME:-$name}"
+  M_CONTAINER="${C_CONTAINER:-}"
+  M_IMAGE="${C_IMAGE:-$DEFAULT_IMAGE}"
+  M_DIR="${C_DIR:-}"
+  M_MODE="${C_MODE:-rw}"
+  M_PORT="${C_PORT:-}"
+  M_BIND="${C_BIND:-$DEFAULT_BIND}"
+  M_CREATED="${C_CREATED:-0}"
+  M_EXPIRES="${C_EXPIRES:-0}"
+  M_DURATION="${C_DURATION:-0}"
+  M_MEM="${C_MEM:-$DEFAULT_MEM}"
+  M_CPUS="${C_CPUS:-$DEFAULT_CPUS}"
+  M_PIDS="${C_PIDS:-$DEFAULT_PIDS}"
+  M_USER="${C_USER:-}"
+  M_STATUS="${C_STATUS:-active}"
+}
+
+meta_save() {
+  local name="$1" f tmp old_umask
+  f="$(meta_file "$name")"
+  tmp="$f.tmp.$$"
+  old_umask="$(umask)"
+  umask 077
+  cat >"$tmp" <<EOF
+C_NAME='${M_NAME:-$name}'
+C_CONTAINER='${M_CONTAINER:-}'
+C_IMAGE='${M_IMAGE:-}'
+C_DIR='${M_DIR:-}'
+C_MODE='${M_MODE:-rw}'
+C_PORT='${M_PORT:-}'
+C_BIND='${M_BIND:-}'
+C_CREATED='${M_CREATED:-0}'
+C_EXPIRES='${M_EXPIRES:-0}'
+C_DURATION='${M_DURATION:-0}'
+C_MEM='${M_MEM:-}'
+C_CPUS='${M_CPUS:-}'
+C_PIDS='${M_PIDS:-}'
+C_USER='${M_USER:-}'
+C_STATUS='${M_STATUS:-active}'
+EOF
+  umask "$old_umask"
+  chmod 600 "$tmp"
+  # 原子替换：写一半崩掉也不会把原元数据截成空文件
+  mv -f "$tmp" "$f"
+}
+
+container_exists() { docker inspect "$1" >/dev/null 2>&1; }
+container_state()  { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo "missing"; }
+
+# -------------------------------------------------------- 危险挂载 / 选项体检
+# 挡掉「把宿主机交出去」的写法
+FORBIDDEN_MOUNTS=(/ /etc /root /home /usr /var /bin /sbin /lib /lib64 /boot /dev /proc /sys /run)
+
+check_mount_path() {
+  local p="$1" r rp
+  rp="$(readlink -m -- "$p" 2>/dev/null || printf '%s' "$p")"
+  [[ $rp == /* ]] || die "挂载路径必须是绝对路径：$p"
+  for r in "${FORBIDDEN_MOUNTS[@]}"; do
+    [[ $rp == "$r" ]] && die "拒绝挂载系统目录本体：$rp（要挂请给具体子目录）"
+  done
+  [[ $rp == /var/run/docker.sock || $rp == /run/docker.sock ]] \
+    && die "拒绝挂载 docker.sock —— 这等于把宿主机 root 交给容器"
+  return 0
+}
+
+# ---------------------------------------------------------------- 基础镜像
+# 构建过程的内存上限：取宿主机可用内存的 3/4，避免在小机器上触发 OOM
+# 把别的服务（数据库、媒体服务器…）一起带走
+build_mem_cap() {
+  local avail v
+  avail="$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+  if (( avail <= 0 )); then printf '1g'; return 0; fi
+  v=$(( avail * 3 / 4 ))
+  (( v < 128 )) && v=128
+  (( v > 2048 )) && v=2048
+  printf '%dm' "$v"
+}
+
+build_base_image() {
+  local img="$1" cap
+  if docker image inspect "$img" >/dev/null 2>&1; then
+    info "基础镜像已存在：$img"
+    return 0
+  fi
+  if [[ $DRY_RUN == yes ]]; then
+    printf '  %s[dry-run]%s docker pull %s（拉不到则本地构建）\n' "$C_D" "$C_0" "$img"
+    return 0
+  fi
+  # 优先从 registry 拉：镜像推到 Docker Hub 后，各机器就不必本地构建
+  local pull_err
+  if pull_err="$(docker pull "$img" 2>&1)"; then
+    ok "已从 registry 拉取：$img"
+    return 0
+  fi
+  warn "拉取 $img 失败，原因如下："
+  printf '%s\n' "$pull_err" | tail -n 4 | sed 's/^/    /'
+  cap="$(build_mem_cap)"
+  info "改为本地构建（内存上限 $cap，约 1-3 分钟）"
+  # 当前目录有 Dockerfile 就用它（方便自定义镜像），否则用内置的那份
+  if [[ -r ./Dockerfile ]]; then
+    info "使用当前目录的 Dockerfile"
+    docker build --memory="$cap" -t "$img" -f ./Dockerfile . || die "基础镜像构建失败"
+  else
+    docker build --memory="$cap" -t "$img" - <<'DOCKERFILE' || die "基础镜像构建失败"
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openssh-server ca-certificates curl wget git vim-tiny less file \
+      python3 python3-pip python3-venv jq unzip zip tar rsync procps iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d \
+ && chmod 700 /root/.ssh \
+ && ssh-keygen -A \
+ && printf 'PermitRootLogin yes\nPasswordAuthentication yes\nUsePAM no\n' \
+      > /etc/ssh/sshd_config.d/99-aidocker.conf
+WORKDIR /work
+EXPOSE 22
+CMD ["/usr/sbin/sshd","-D","-e"]
+DOCKERFILE
+  fi
+  ok "基础镜像就绪：$img"
+}
+
+# ------------------------------------------------------------------ 起容器
+cmd_new() {
+  local -a p=("$@")
+  if (( ${#p[@]} == 0 )) || [[ ${p[0]:-} == -h || ${p[0]:-} == --help ]]; then
+    usage_new
+    return 0
+  fi
+
+  local name="${p[0]}"
+  local dir="" dur="" image="" mode="rw" bind="$DEFAULT_BIND" host_port=""
+  local mem="$DEFAULT_MEM" cpus="$DEFAULT_CPUS" pids="$DEFAULT_PIDS"
+  local pw="" pubkey="" run_user="" readonly=0 pubkey_file=""
+
+  local -a rest=("${p[@]:1}")
+  local a
+  for a in "${rest[@]}"; do
+    [[ -z $a ]] && continue
+    case "$a" in
+      --ro)          mode="ro" ;;
+      --rw)          mode="rw" ;;
+      --public)      bind="0.0.0.0" ;;
+      --bind=*)      bind="${a#--bind=}" ;;
+      --port=*)      host_port="${a#--port=}"
+                     [[ $host_port =~ ^[0-9]+$ ]] || die "--port 必须是数字，例如 --port=2000" ;;
+      --readonly)    readonly=1 ;;
+      --password=*)  pw="${a#--password=}" ;;
+      --pubkey=*)    pubkey="${a#--pubkey=}" ;;
+      --pubkey-file=*) pubkey_file="${a#--pubkey-file=}" ;;
+      --user=*)      run_user="${a#--user=}" ;;
+      --image=*)     image="${a#--image=}" ;;
+      --mem=*)       mem="${a#--mem=}" ;;
+      --cpus=*)      cpus="${a#--cpus=}" ;;
+      --pids=*)      pids="${a#--pids=}" ;;
+      --*)           die "未知选项：$a（-h 查看用法）" ;;
+      *)
+        if [[ $a == */* ]]; then
+          [[ -n $dir ]] && die "指定了多个目录：$dir 与 $a"
+          dir="$a"
+        elif is_duration "$a"; then
+          dur="$a"
+        elif [[ -z $dir ]]; then
+          dir="$a"
+        else
+          die "参数无法识别：$a（用法：new <名字> [目录] [时长] [选项]）"
+        fi
+        ;;
+    esac
+  done
+
+  [[ $name =~ ^[a-z0-9][a-z0-9_-]{0,30}$ ]] \
+    || die "名字非法：只允许小写字母/数字/下划线/短横线，≤31 字符"
+  is_managed "$name" && die "$name 已在管理中，用 extend / del / status"
+
+  dur="${dur:-$DEFAULT_DURATION}"
+  image="${image:-$DEFAULT_IMAGE}"
+  local secs created expires never=0
+  secs="$(parse_duration "$dur")"
+  created="$(date +%s)"
+  if (( secs == 0 )); then
+    never=1
+    expires=0
+  else
+    expires=$(( created + secs ))
+  fi
+
+  # 目录：不指定就建一个专属空目录
+  if [[ -z $dir ]]; then
+    dir="$LIB_DIR/work/$name"
+    info "未指定目录，使用专属目录：$dir"
+  fi
+  dir="$(readlink -m -- "$dir" 2>/dev/null || printf '%s' "$dir")"
+  check_mount_path "$dir"
+  if [[ ! -d $dir ]]; then
+    info "目录不存在，先建出来：$dir"
+    run mkdir -p "$dir"
+  fi
+
+  # 凭据
+  if [[ -n $pubkey_file ]]; then
+    [[ -r $pubkey_file ]] || die "公钥文件不可读：$pubkey_file"
+    pubkey="$(head -n1 "$pubkey_file")"
+  fi
+  if [[ -n $pubkey ]]; then
+    [[ $pubkey =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]] ]] \
+      || die "公钥格式不正确（应以 ssh-ed25519 / ssh-rsa / ecdsa-... 开头）"
+  fi
+  if [[ -z $pubkey && -z $pw ]]; then
+    pw="$(tr -dc 'A-Za-z0-9@#%^_+=!' </dev/urandom | head -c 24 || true)"
+  fi
+
+  local cname; cname="$(container_of "$name")"
+  if container_exists "$cname"; then
+    die "docker 里已存在同名容器 $cname（非本工具管理？先 docker rm -f $cname）"
+  fi
+
+  # 基础镜像必须先就位，否则 docker run 只会吐一句 Unable to find image
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if [[ $DRY_RUN == yes ]]; then
+      warn "本机没有镜像 $image，真跑之前要先 install 或 import"
+    elif pull_err="$(docker pull "$image" 2>&1)"; then
+      ok "已从 registry 拉取镜像：$image"
+    else
+      warn "拉取 $image 失败，原因如下："
+      printf '%s\n' "$pull_err" | tail -n 4 | sed 's/^/    /'
+      die "本机没有镜像 $image
+
+  两条路，任选其一：
+    1) 本机构建（需要外网，约 1-3 分钟）
+         sudo $0 install
+    2) 从已经装好的机器上导入（离线，小内存机器推荐）
+         在那边：  sudo $0 export /tmp/aidocker-base.tar.gz
+         拷过来：  scp 那边:/tmp/aidocker-base.tar.gz .
+         在本机：  sudo $0 import aidocker-base.tar.gz"
+    fi
+  fi
+
+  # 组装 docker run
+  local -a args=(run -d --name "$cname" --hostname "$name")
+  args+=(--memory "$mem" --cpus "$cpus" --pids-limit "$pids")
+  args+=(--security-opt no-new-privileges)
+  args+=(--cap-drop=SYS_ADMIN --cap-drop=SYS_MODULE --cap-drop=SYS_PTRACE)
+  args+=(--cap-drop=SYS_RAWIO --cap-drop=MKNOD --cap-drop=AUDIT_WRITE)
+  args+=(--restart no)
+  args+=(--ulimit nofile=4096:4096)
+  args+=(-e "TZ=${TZ:-Asia/Shanghai}")
+  [[ -n $run_user ]] && args+=(--user "$run_user")
+  (( readonly )) && args+=(--read-only --tmpfs /tmp:rw,size=512m --tmpfs /run:rw,size=64m)
+  args+=(-v "$dir:/work${mode:+:$mode}")
+  args+=(-w /work)
+  args+=(-p "${bind}:${host_port}:22")
+  args+=("$image")
+
+  local dur_text; dur_text="$(human_duration "$secs")"
+  (( never )) && dur_text="永不过期"
+  info "起容器 $cname：镜像 $image，目录 $dir ($mode)，时长 $dur_text"
+  run docker "${args[@]}"
+
+  if [[ $DRY_RUN == no ]]; then
+    # 等 sshd 起来
+    local i
+    for i in $(seq 1 40); do
+      docker exec "$cname" true >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+
+    if [[ -n $pw ]]; then
+      printf 'root:%s\n' "$pw" | docker exec -i "$cname" chpasswd >/dev/null 2>&1 \
+        || warn "设置容器内 root 密码失败（容器可能没起来）"
+    fi
+    if [[ -n $pubkey ]]; then
+      docker exec "$cname" sh -c 'mkdir -p /root/.ssh && chmod 700 /root/.ssh' >/dev/null 2>&1 || true
+      # 公钥经 stdin 写入：拼进 sh -c 字符串时，密钥注释里的引号会破坏命令
+      printf '%s\n' "$pubkey" \
+        | docker exec -i "$cname" sh -c 'cat > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys' \
+        >/dev/null 2>&1 || warn "写入容器内公钥失败"
+    fi
+  fi
+
+  local port=""
+  if [[ $DRY_RUN == no ]]; then
+    port="$(docker port "$cname" 22/tcp 2>/dev/null | head -n1 | sed 's/.*://')"
+  fi
+
+  M_NAME="$name"; M_CONTAINER="$cname"; M_IMAGE="$image"
+  M_DIR="$dir"; M_MODE="$mode"; M_PORT="$port"; M_BIND="$bind"
+  M_CREATED="$created"; M_EXPIRES="$expires"; M_DURATION="$secs"
+  M_MEM="$mem"; M_CPUS="$cpus"; M_PIDS="$pids"; M_USER="$run_user"
+  M_STATUS="active"
+  run meta_save "$name"
+
+  audit "new name=$name container=$cname dir=$dir mode=$mode expires=$expires port=$port image=$image"
+
+  # 绑 0.0.0.0 时自动探测公网 IP，省得手工替换
+  local login_host="$bind"
+  if [[ $bind == "0.0.0.0" ]]; then
+    login_host="$(detect_public_ip || printf '<公网IP探测失败，请手动填>')"
+  fi
+
+  echo
+  ok "容器就绪"
+  if [[ -n $port ]]; then
+    printf '  %s登录%s     ssh -p %s root@%s\n' "$C_B" "$C_0" "$port" "$login_host"
+  fi
+  [[ -n $pw ]] && printf '  %s密码%s     %s\n' "$C_D" "$C_0" "$pw"
+  printf '  %s路径%s     %s -> /work (%s)\n' "$C_D" "$C_0" "$dir" "$mode"
+  if (( never )); then
+    printf '  %s到期%s     永不过期\n' "$C_D" "$C_0"
+  else
+    printf '  %s到期%s     %s（%s 后）\n' "$C_D" "$C_0" "$(date -d "@$expires" '+%F %T')" "$(human_duration "$secs")"
+  fi
+  printf '  %s资源%s     mem=%s cpus=%s pids=%s\n' "$C_D" "$C_0" "$mem" "$cpus" "$pids"
+  printf '  %s归属%s     容器内 root 写出的文件，在宿主机上属主是 root（要归你可加 --user=%s:%s）\n' \
+    "$C_D" "$C_0" "$(id -u)" "$(id -g)"
+  echo
+  printf '  %s进容器%s   sudo aidocker exec %s\n' "$C_B" "$C_0" "$name"
+  echo
+  if [[ $bind != "127.0.0.1" && $bind != "localhost" ]]; then
+    warn "端口已开放到 $bind —— 任何能访问该地址的人都能尝试 SSH 登录"
+    if [[ -z $pubkey ]]; then
+      warn "  当前仅密码认证；公网暴露强烈建议改用 --pubkey='ssh-ed25519 AAAA...'"
+    fi
+    if [[ -n $port ]]; then
+      warn "  建议用防火墙限制来源：ufw allow from <你的IP> to any port $port proto tcp"
+    fi
+  fi
+  [[ -n $pw ]] && warn "密码只显示这一次，请立即转交给使用者"
+  if (( never )); then
+    warn "永不过期：这个容器不会被自动停用，用完记得手动 del"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ 列表详情
+cmd_list() {
+  local f any=0
+  printf '%-14s %-10s %-19s %-19s %-10s %-8s %s\n' NAME STATUS CREATED EXPIRES REMAIN PORT MOUNT
+  printf '%s\n' "---------------------------------------------------------------------------------------------------------"
+  shopt -s nullglob
+  for f in "$META_DIR"/*.meta; do
+    any=1
+    # shellcheck disable=SC1090
+    ( . "$f"
+      if (( ${C_EXPIRES:-0} == 0 )); then
+        exp="永不过期"; rem="never"
+      else
+        exp="$(date -d "@$C_EXPIRES" '+%F %T')"
+        rem="$(human_duration $(( C_EXPIRES - $(date +%s) )))"
+      fi
+      printf '%-14s %-10s %-19s %-19s %-10s %-8s %s\n' \
+        "$C_NAME" "$C_STATUS" \
+        "$(date -d "@$C_CREATED" '+%F %T')" "$exp" "$rem" "${C_PORT:-?}" "$C_DIR" )
+  done
+  shopt -u nullglob
+  (( any )) || log "（暂无受管容器）"
+}
+
+cmd_status() {
+  local name="${1:-}"; [[ -n $name ]] || die "用法：status <名字>"
+  meta_load "$name"
+  local now remain state
+  now="$(date +%s)"; remain=$(( M_EXPIRES - now ))
+  state="$(container_state "$M_CONTAINER")"
+  echo "名字      : $M_NAME"
+  echo "容器名    : $M_CONTAINER"
+  echo "状态      : $M_STATUS（docker: $state）"
+  echo "镜像      : $M_IMAGE"
+  echo "挂载      : $M_DIR -> /work ($M_MODE)"
+  echo "创建      : $(date -d "@$M_CREATED" '+%F %T')"
+  if (( M_EXPIRES == 0 )); then
+    echo "到期      : 永不过期（回收器会跳过这个容器）"
+  else
+    echo "到期      : $(date -d "@$M_EXPIRES" '+%F %T')  （剩余 $(human_duration "$remain")）"
+  fi
+  echo "总时长    : $(human_duration "$M_DURATION")"
+  echo "资源      : mem=$M_MEM cpus=$M_CPUS pids=$M_PIDS"
+  echo "端口      : ${M_PORT:-?}（绑定 $M_BIND）"
+  echo "运行用户  : ${M_USER:-root（容器内）}"
+  if [[ $state != missing ]]; then
+    echo "IP        : $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$M_CONTAINER" 2>/dev/null || echo '?')"
+    echo "启动时间  : $(docker inspect -f '{{.State.StartedAt}}' "$M_CONTAINER" 2>/dev/null || echo '?')"
+  fi
+}
+
+cmd_exec() {
+  local name="${1:-}"; shift || true
+  [[ -n $name ]] || die "用法：exec <名字> [命令...]"
+  meta_load "$name"
+  local cname="$M_CONTAINER"
+  container_exists "$cname" || die "容器 $cname 不存在"
+  if (( $# )); then
+    exec docker exec -i "$cname" "$@"
+  else
+    exec docker exec -it "$cname" bash -l
+  fi
+}
+
+# --------------------------------------------------------------------- 延长
+cmd_extend() {
+  local name="${1:-}" dur="${2:-}"
+  [[ -n $name && -n $dur ]] || die "用法：extend <名字> <时长>"
+  meta_load "$name"
+  if (( M_EXPIRES == 0 )); then
+    info "$name 当前是永不过期，无需延长"
+    return 0
+  fi
+  local add expires
+  add="$(parse_duration "$dur")"
+  (( add > 0 )) || die "extend 不接受 never（这个容器本来就有到期时间，要延长请给具体时长）"
+  expires=$(( M_EXPIRES + add ))
+  M_EXPIRES="$expires"
+  M_DURATION=$(( M_DURATION + add ))
+  [[ $M_STATUS == expired ]] && M_STATUS="active"
+  run meta_save "$name"
+  if [[ $M_STATUS == active && $DRY_RUN == no ]] && container_exists "$M_CONTAINER"; then
+    docker start "$M_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  audit "extend name=$name add=${add}s new_expires=$expires"
+  ok "$name 已延长 $(human_duration "$add")，新到期：$(date -d "@$expires" '+%F %T')"
+}
+
+# --------------------------------------------------------- 停用 / 删除 / 回收
+stop_container() {
+  local cname="$1" mode="${2:-expire}"
+  container_exists "$cname" || { info "容器 $cname 已不存在"; return 0; }
+  run docker stop -t 10 "$cname" >/dev/null 2>&1 || true
+  ok "容器已停止：$cname"
+}
+
+cmd_del() {
+  local name="${1:-}" force=0
+  shift || true
+  while (( $# )); do
+    case "$1" in
+      -y|--yes) force=1; shift ;;
+      *) die "未知参数：$1（用法：del <名字> [-y]）" ;;
+    esac
+  done
+  [[ -n $name ]] || die "用法：del <名字> [-y]"
+  meta_load "$name"
+
+  if (( force == 0 )); then
+    if [[ -t 0 ]]; then
+      printf '将停止并删除容器 %s。挂载目录 %s 会原样保留（脚本不碰宿主机文件）。确认？[y/N] ' \
+        "$M_CONTAINER" "$M_DIR"
+      local ans=""
+      read -r ans || true
+      case "$ans" in
+        y|Y|yes|YES) ;;
+        *) info "已取消，容器保持原样"; return 0 ;;
+      esac
+    else
+      die "非交互环境需显式确认：del $name -y"
+    fi
+  fi
+
+  if container_exists "$M_CONTAINER"; then
+    run docker rm -f "$M_CONTAINER" >/dev/null 2>&1 || true
+    ok "容器已删除：$M_CONTAINER"
+  else
+    info "容器 $M_CONTAINER 已不存在"
+  fi
+  # 元数据一并删掉：容器都没了，留着只会挡住同名重建
+  run rm -f "$(meta_file "$name")"
+  audit "del name=$name container=$M_CONTAINER"
+  ok "$name 已清理，元数据已删除（挂载目录 $M_DIR 未改动）"
+}
+
+cmd_cleanup() {
+  local f name now
+  now="$(date +%s)"
+  shopt -s nullglob
+  for f in "$META_DIR"/*.meta; do
+    ( . "$f" 2>/dev/null
+      [[ ${C_STATUS:-} == active ]] || exit 0
+      [[ -n ${C_EXPIRES:-} ]] || exit 0
+      (( ${C_EXPIRES:-0} > 0 )) || exit 0      # 0 = 永不过期，回收器不碰
+      (( C_EXPIRES <= $(date +%s) )) || exit 0
+      echo "${C_NAME:-}" ) | while read -r name; do
+        [[ -n $name ]] || continue
+        info "处理到期容器：$name"
+        meta_load "$name"
+        stop_container "$M_CONTAINER" expire
+        if [[ $PURGE_ON_EXPIRE == yes ]]; then
+          container_exists "$M_CONTAINER" && run docker rm -f "$M_CONTAINER" >/dev/null 2>&1 || true
+          M_STATUS="removed"
+        else
+          M_STATUS="expired"
+        fi
+        run meta_save "$name"
+        audit "expire name=$name purge=$PURGE_ON_EXPIRE"
+        ok "$name 已到期停用"
+      done
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# ------------------------------------------------------------ 回收器 / 安装
+install_reaper() {
+  if need_cmd systemctl && [[ -d /run/systemd/system ]]; then
+    if [[ $DRY_RUN == no ]]; then
+      cat >"$REAPER_SVC" <<EOF
+[Unit]
+Description=aidocker expiry reaper
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$SELF_DEST cleanup --quiet
+Nice=10
+EOF
+      cat >"$REAPER_TIMER" <<EOF
+[Unit]
+Description=Run aidocker cleanup periodically
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${REAPER_INTERVAL_SEC}s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+      chmod 644 "$REAPER_SVC" "$REAPER_TIMER"
+      rm -f "$REAPER_CRON"
+    fi
+    run systemctl daemon-reload
+    run systemctl enable --now aidocker-reaper.timer
+    ok "到期回收器已启用：systemd timer（每 ${REAPER_INTERVAL_SEC}s）"
+  else
+    if [[ $DRY_RUN == no ]]; then
+      cat >"$REAPER_CRON" <<EOF
+# 由 aidocker 生成 —— 每分钟检查一次到期容器
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root $SELF_DEST cleanup --quiet
+EOF
+      chmod 644 "$REAPER_CRON"
+    fi
+    ok "到期回收器已启用：cron（每分钟）"
+  fi
+
+  if [[ $DRY_RUN == no && -d /etc/logrotate.d ]]; then
+    cat >"$LOGROTATE_CONF" <<EOF
+$LOG_DIR/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+EOF
+    chmod 644 "$LOGROTATE_CONF"
+  fi
+}
+
+cmd_install() {
+  require_docker
+  ensure_dirs
+  if (( _host_mem_mb > 0 && _host_mem_mb < 1024 )); then
+    warn "宿主机内存仅 ${_host_mem_mb}MiB，构建会限制在 $(build_mem_cap)，避免影响其他服务"
+  fi
+  if [[ $DRY_RUN == no ]]; then
+    if [[ ! -f $CONF_FILE ]]; then
+      cat >"$CONF_FILE" <<EOF
+# aidocker 全局默认（改完立即生效，无需重装）
+DEFAULT_DURATION="$DEFAULT_DURATION"
+DEFAULT_MEM="$DEFAULT_MEM"
+DEFAULT_CPUS="$DEFAULT_CPUS"
+DEFAULT_PIDS="$DEFAULT_PIDS"
+DEFAULT_IMAGE="$BUILTIN_IMAGE"
+DEFAULT_BIND="$DEFAULT_BIND"
+PURGE_ON_EXPIRE="$PURGE_ON_EXPIRE"
+REAPER_INTERVAL_SEC=$REAPER_INTERVAL_SEC
+EOF
+      chmod 640 "$CONF_FILE"
+      ok "默认配置 -> $CONF_FILE"
+    else
+      # 脚本里的默认镜像可能变了（比如改成 Docker Hub 上的），同步进旧配置，
+      # 否则已装过的机器会一直抱着老镜像名不放
+      local cur
+      cur="$(grep '^DEFAULT_IMAGE=' "$CONF_FILE" | head -n1 | cut -d= -f2- | tr -d '"')"
+      if [[ -n $cur && $cur != "$BUILTIN_IMAGE" ]]; then
+        sed -i "s|^DEFAULT_IMAGE=.*|DEFAULT_IMAGE=\"$BUILTIN_IMAGE\"|" "$CONF_FILE"
+        DEFAULT_IMAGE="$BUILTIN_IMAGE"   # 同步内存变量，否则本次 install 还在用旧镜像名
+        info "默认镜像已更新：$cur -> $BUILTIN_IMAGE"
+      fi
+    fi
+    local self=""
+    self="$(self_path 2>/dev/null || true)"
+    if [[ $self == "$SELF_DEST" ]]; then
+      : # 已经在目标位置，无需复制
+    elif [[ -n $self ]]; then
+      install -m 755 "$self" "$SELF_DEST"
+      ok "主程序 -> $SELF_DEST"
+    else
+      # 管道执行：脚本只在 stdin 里，按 SELF_URL 回取一份
+      info "从 $SELF_URL 获取主程序"
+      local tmp="$SELF_DEST.tmp.$$"
+      if need_cmd curl; then
+        curl -fsSL -m 60 "$SELF_URL" -o "$tmp" || die "下载失败：$SELF_URL"
+      elif need_cmd wget; then
+        wget -qO "$tmp" "$SELF_URL" || die "下载失败：$SELF_URL"
+      else
+        die "需要 curl 或 wget 才能把自己装到 $SELF_DEST"
+      fi
+      [[ -s $tmp ]] || { rm -f "$tmp"; die "下载到的内容为空：$SELF_URL"; }
+      chmod 755 "$tmp"
+      mv -f "$tmp" "$SELF_DEST"
+      ok "主程序 -> $SELF_DEST（从 $SELF_URL 下载）"
+    fi
+  fi
+  build_base_image "$DEFAULT_IMAGE"
+  install_reaper
+  ok "安装完成。下一步：sudo aidocker new ai /clicd 2h"
+}
+
+cmd_uninstall() {
+  local all=0
+  while (( $# )); do case "$1" in --all) all=1; shift ;; *) die "未知参数：$1" ;; esac; done
+  need_cmd systemctl && run systemctl disable --now aidocker-reaper.timer 2>/dev/null || true
+  run rm -f "$REAPER_SVC" "$REAPER_TIMER" "$REAPER_CRON" "$LOGROTATE_CONF"
+  need_cmd systemctl && run systemctl daemon-reload 2>/dev/null || true
+  if (( all )); then
+    local f
+    shopt -s nullglob
+    for f in "$META_DIR"/*.meta; do
+      ( . "$f" 2>/dev/null; echo "${C_NAME:-}" ) | while read -r n; do
+        [[ -n $n ]] && cmd_del "$n" -y
+      done
+    done
+    shopt -u nullglob
+  fi
+  ok "回收器已卸载（元数据保留在 $LIB_DIR）"
+}
+
+# ------------------------------------------------------------ 镜像离线分发
+# 小内存机器不适合本地构建，从已装好的机器导出再导入更省事
+cmd_export() {
+  local out="${1:-./aidocker-base.tar.gz}"
+  require_docker
+  docker image inspect "$DEFAULT_IMAGE" >/dev/null 2>&1 \
+    || die "本机没有 $DEFAULT_IMAGE，先跑 install 构建出来"
+  if [[ $DRY_RUN == yes ]]; then
+    printf '  %s[dry-run]%s docker save %s | gzip > %s\n' "$C_D" "$C_0" "$DEFAULT_IMAGE" "$out"
+    return 0
+  fi
+  info "导出 $DEFAULT_IMAGE -> $out（约 380MB，压缩需要一两分钟）"
+  docker save "$DEFAULT_IMAGE" | gzip -1 > "$out" || die "导出失败"
+  ok "导出完成：$out（$(du -h "$out" 2>/dev/null | cut -f1)）"
+  echo "  拷到目标机器后执行：sudo $SELF_DEST import $out"
+}
+
+cmd_import() {
+  local f="${1:-}"
+  [[ -n $f ]] || die "用法：import <镜像文件.tar.gz>"
+  [[ -r $f ]] || die "文件不可读：$f"
+  require_docker
+  if [[ $DRY_RUN == yes ]]; then
+    printf '  %s[dry-run]%s gunzip -c %s | docker load\n' "$C_D" "$C_0" "$f"
+    return 0
+  fi
+  info "导入镜像（约需 1-2 分钟）"
+  gunzip -c "$f" | docker load || die "导入失败，文件可能不完整"
+  docker images "$DEFAULT_IMAGE" --format '  {{.Repository}}:{{.Tag}}  {{.Size}}'
+  ok "导入完成，现在可以 new 了"
+}
+
+# --------------------------------------------------------------------- 自检
+cmd_check() {
+  local rc=0
+  echo "== docker =="
+  if need_cmd docker; then
+    printf '  %sok%s   docker 已安装：%s\n' "$C_G" "$C_0" "$(docker --version 2>/dev/null)"
+    if docker info >/dev/null 2>&1; then
+      printf '  %sok%s   守护进程可连接\n' "$C_G" "$C_0"
+      printf '  %s信息%s   storage-driver=%s cgroup=%s\n' "$C_B" "$C_0" \
+        "$(docker info -f '{{.Driver}}' 2>/dev/null)" "$(docker info -f '{{.CgroupVersion}}' 2>/dev/null)"
+    else
+      printf '  %s危%s   连不上守护进程\n' "$C_R" "$C_0"; rc=1
+    fi
+  else
+    printf '  %s危%s   未安装 docker\n' "$C_R" "$C_0"; rc=1
+  fi
+
+  echo "== 基础镜像 =="
+  if need_cmd docker && docker image inspect "$DEFAULT_IMAGE" >/dev/null 2>&1; then
+    printf '  %sok%s   %s\n' "$C_G" "$C_0" "$DEFAULT_IMAGE"
+  else
+    printf '  %s危%s   基础镜像缺失，跑 install\n' "$C_R" "$C_0"; rc=1
+  fi
+
+  echo "== 回收器 =="
+  if need_cmd systemctl && systemctl is-active --quiet aidocker-reaper.timer 2>/dev/null; then
+    printf '  %sok%s   systemd timer 运行中\n' "$C_G" "$C_0"
+  elif [[ -f $REAPER_CRON ]]; then
+    printf '  %sok%s   cron 已安装\n' "$C_G" "$C_0"
+  else
+    printf '  %s危%s   回收器未安装，到期不会自动停容器\n' "$C_R" "$C_0"; rc=1
+  fi
+
+  echo "== 受管容器 =="
+  local f n=0
+  shopt -s nullglob
+  for f in "$META_DIR"/*.meta; do
+    n=$(( n + 1 ))
+    ( . "$f" 2>/dev/null
+      printf '  %-14s %-10s dir=%s\n' "${C_NAME:-?}" "${C_STATUS:-?}" "${C_DIR:-?}" )
+  done
+  shopt -u nullglob
+  echo "  合计：$n"
+
+  echo "== 提醒 =="
+  echo "  bind mount 的目录没有磁盘配额：容器内写满它 = 写满宿主机对应分区。"
+  echo "  容器内 root 写出的文件在宿主机上属主是 root；要能自己改就加 --user=\$(id -u):\$(id -g)。"
+  return $rc
+}
+
+# --------------------------------------------------------------------- 用法
+usage_new() {
+  cat <<'EOF'
+用法：new <名字> [目录] [时长] [选项]
+
+  sudo aidocker new ai /clicd 2h
+      起一个容器，把 /clicd 挂到容器内 /work，容器内 root，2 小时后自动停
+
+  sudo aidocker new ai /clicd never
+      同上，但永不过期（不会被自动停用，用完要手动 del）
+
+  sudo aidocker new ai /clicd 2h --public
+      端口绑到 0.0.0.0（默认只绑 127.0.0.1，只有本机能连）
+
+  位置参数（顺序随意）
+    名字     容器标识，小写字母/数字/_/-，≤31 字符        必填
+    目录     挂进容器 /work 的宿主目录                     省略 -> /var/lib/aidocker/work/<名字>
+    时长     30m 2h 12h 7d                                省略 -> 24h
+             never / forever / permanent = 永不过期（不会被自动停用）
+
+  选项
+    --ro              目录只读挂载（容器内改不了）
+    --public          端口绑 0.0.0.0（默认 127.0.0.1）
+    --readonly        容器根文件系统只读，只留 /tmp /run 可写
+    --password=xxx    指定容器内 root 密码（默认自动生成）
+    --pubkey='ssh-ed25519 AAAA...'   用公钥登录
+    --pubkey-file=PATH               从文件读公钥（取首行）
+    --user=uid:gid    以该 uid/gid 运行（挂载目录里写出的文件归它）
+    --image=xxx       换镜像（默认 $BUILTIN_IMAGE）
+    --mem=2g --cpus=2 --pids=512     资源上限
+
+  容器内默认：root 用户，工作目录 /work，开放 sshd（22）
+EOF
+}
+
+usage() {
+  cat <<EOF
+aidocker $VERSION — 给 AI 一个用完即焚的一次性容器
+
+用法：sudo $0 <子命令> [选项]
+
+最常用
+  sudo $0 new ai /clicd 2h        起容器：挂 /clicd，2 小时，容器内 root
+  sudo $0 del ai                  停掉并删除容器（宿主机目录不动）
+
+首次使用先装（否则没有短命令，到期也不会自动停容器）
+  sudo $0 install
+
+子命令
+  new <名字> [目录] [时长] [选项]    起一个容器（-h 看全部选项）
+  install                            构建基础镜像 + 安装到期回收器
+  uninstall [--all]                  卸载回收器（--all 连同容器一起删）
+  export [文件]                      导出基础镜像，供离线分发到别的机器
+  import <文件>                      导入基础镜像（小内存机器免构建）
+  list                               列出受管容器与剩余时间
+  status <名字>                      查看详情
+  exec <名字> [命令]                 进入容器（等同于 docker exec -it）
+  extend <名字> <时长>               延长存活时长
+  del <名字> [-y]                    停掉并删除容器
+  cleanup                            手动跑一次到期回收
+  check                              环境自检
+
+安全默认（都已强制，手工绕过等于放弃隔离）
+  · 端口只绑 127.0.0.1
+  · 不挂 docker.sock、不 --privileged、不 host 网络/pid
+  · 削减 SYS_ADMIN / SYS_MODULE / SYS_PTRACE / SYS_RAWIO / MKNOD 等 capability
+  · no-new-privileges、pids-limit、内存与 CPU 上限
+
+全局
+  --dry-run   只打印将要执行的动作
+  --quiet     安静模式
+
+示例
+  sudo $0 new ai /clicd 2h
+  sudo $0 new ai /clicd never
+  sudo $0 new ai /clicd 7d --mem=4g --cpus=4
+  sudo $0 new ai /srv/data 12h --ro --user=1000:1000
+  sudo $0 exec ai
+  sudo $0 extend ai 1h
+  sudo $0 del ai -y
+EOF
+}
+
+# --------------------------------------------------------------------- main
+main() {
+  local -a argv=()
+  while (( $# )); do
+    case "$1" in
+      --dry-run) DRY_RUN=yes; shift ;;
+      --quiet)   QUIET=yes; shift ;;
+      --version|-V) echo "$VERSION"; exit 0 ;;
+      *) argv+=("$1"); shift ;;
+    esac
+  done
+  set -- "${argv[@]+"${argv[@]}"}"
+
+  local sub="${1:-}"
+  # 管道执行（wget … | bash）且没给子命令时，默认做 install
+  if [[ -z $sub ]] && ! self_path >/dev/null 2>&1; then
+    sub="install"
+  fi
+  case "$sub" in
+    ""|-h|--help|help) usage; exit 0 ;;
+    install)   require_root; cmd_install ;;
+    uninstall) require_root; shift; cmd_uninstall "$@" ;;
+    export|save) require_root; shift; cmd_export "$@" ;;
+    import|load) require_root; shift; cmd_import "$@" ;;
+    check)     cmd_check ;;
+    list)      require_root; cmd_list ;;
+    status)    require_root; shift; cmd_status "$@" ;;
+    cleanup)   require_root; require_docker; cmd_cleanup ;;
+    new|add|run)
+      require_root; require_docker; ensure_dirs
+      exec 9>"$LOCK_FILE"
+      flock -n 9 || die "另一个实例正在运行，稍后再试"
+      shift; cmd_new "$@" ;;
+    exec)
+      require_root; require_docker
+      shift; cmd_exec "$@" ;;
+    extend)
+      require_root; ensure_dirs
+      exec 9>"$LOCK_FILE"
+      flock -n 9 || die "另一个实例正在运行，稍后再试"
+      shift; cmd_extend "$@" ;;
+    del|delete|remove)
+      require_root; require_docker; ensure_dirs
+      exec 9>"$LOCK_FILE"
+      flock -n 9 || die "另一个实例正在运行，稍后再试"
+      shift; cmd_del "$@" ;;
+    *) die "未知子命令：$sub（-h 查看用法）" ;;
+  esac
+}
+
+main "$@"
